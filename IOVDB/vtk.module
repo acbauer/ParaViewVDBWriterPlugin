@@ -1,0 +1,10 @@
+NAME
+  VDBWriters
+LIBRARY_NAME
+  vtkVDBWriters
+DEPENDS
+  ParaView::VTKExtensionsIOCore
+PRIVATE_DEPENDS
+  ParaView::RemotingClientServerStream
+  VTK::ParallelCore
+  VTK::vtksys

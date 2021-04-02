@@ -1,0 +1,11 @@
+NAME
+  VDBWriter
+DESCRIPTION
+  Write out VDB files
+REQUIRES_MODULES
+  ParaView::VTKExtensionsIOCore
+  ParaView::RemotingClientServerStream
+  VTK::ParallelCore
+  VTK::vtksys
+
+

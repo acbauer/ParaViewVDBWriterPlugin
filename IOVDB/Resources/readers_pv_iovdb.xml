@@ -1,0 +1,39 @@
+<ServerManagerConfiguration>
+  <ProxyGroup name="writers">
+
+    <!-- ================================================================= -->
+    <WriterProxy class="vtkVDBWriter"
+                 name="VDBWriter"
+                 supports_parallel="1">
+      <Documentation short_help="Write OpenVDB file.">Writer to
+      write an OpenFDB file."</Documentation>
+      <InputProperty command="SetInputConnection"
+                     panel_visibility="never"
+                     name="Input">
+        <DataTypeDomain composite_data_supported="0"
+                        name="input_type">
+          <DataType value="vtkImageData" />
+          <DataType value="vtkPointSet" />
+        </DataTypeDomain>
+        <Documentation>The input filter/source whose output dataset is to
+        written to the file.</Documentation>
+      </InputProperty>
+      <StringVectorProperty command="SetFileName"
+                            name="FileName"
+                            panel_visibility="never"
+                            number_of_elements="1">
+        <Documentation>The name of the file to be written.</Documentation>
+      </StringVectorProperty>
+      <Hints>
+        <Property name="Input"
+                  show="0" />
+        <Property name="FileName"
+                  show="0" />
+        <WriterFactory extensions="vdb"
+                       file_description="OpenFDB File Format" />
+      </Hints>
+      <!-- End of VDBWriter -->
+    </WriterProxy>
+
+  </ProxyGroup>
+</ServerManagerConfiguration>

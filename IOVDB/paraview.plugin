@@ -1,0 +1,10 @@
+NAME
+  VDBWriter
+DESCRIPTION
+  Write out a VDB file
+REQUIRES_MODULES
+  # This module provides the `vtkCellDerivatives` filter.
+  ParaView::VTKExtensionsIOCore
+  ParaView::RemotingClientServerStream
+  VTK::ParallelCore
+  VTK::vtksys

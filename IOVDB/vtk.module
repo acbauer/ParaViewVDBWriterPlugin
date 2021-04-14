@@ -8,3 +8,4 @@ PRIVATE_DEPENDS
   ParaView::RemotingClientServerStream
   VTK::ParallelCore
   VTK::vtksys
+  VTK::RenderingCore

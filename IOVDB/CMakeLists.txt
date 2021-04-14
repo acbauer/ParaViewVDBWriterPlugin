@@ -50,4 +50,4 @@ vtk_module_link(VDBWriters
 
 
 paraview_add_server_manager_xmls(
-  XMLS Resources/readers_pv_iovdb.xml)
+  XMLS Resources/writers_pv_iovdb.xml)

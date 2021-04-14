@@ -16,6 +16,7 @@
 
 #include "vtkCellData.h"
 #include "vtkCommunicator.h"
+#include "vtkDiscretizableColorTransferFunction.h"
 #include "vtkFloatArray.h"
 #include "vtkImageData.h"
 #include "vtkInformation.h"
@@ -25,8 +26,10 @@
 #include "vtkObjectFactory.h"
 #include "vtkPointData.h"
 #include "vtkPointSet.h"
+#include "vtkScalarsToColors.h"
 #include "vtkSmartPointer.h"
 #include "vtkStreamingDemandDrivenPipeline.h"
+#include "vtkUnsignedCharArray.h"
 
 #include "vtksys/FStream.hxx"
 #include <vtksys/SystemTools.hxx>
@@ -40,17 +43,44 @@
 #include <openvdb/openvdb.h>
 #include <openvdb/points/PointConversion.h>
 #include <openvdb/points/PointCount.h>
+#include <openvdb/tools/Dense.h>
+
+namespace
+{
+std::string GetVDBGridName(const char* arrayName, int component, int numberOfComponents)
+{
+  std::string vdbName = arrayName;
+  if (numberOfComponents != 1 and numberOfComponents != 3)
+  {
+    vdbName = vdbName + "_" + std::to_string(component);
+  }
+  return vdbName;
+}
+
+}
 
 vtkStandardNewMacro(vtkVDBWriter);
 vtkCxxSetObjectMacro(vtkVDBWriter, Controller, vtkMultiProcessController);
+vtkCxxSetObjectMacro(vtkVDBWriter, LookupTable, vtkScalarsToColors);
 //-----------------------------------------------------------------------------
 vtkVDBWriter::vtkVDBWriter()
 {
   // openvdb::initialize() can be called multiple times
   openvdb::initialize();
   this->FileName = nullptr;
+  this->WriteAllTimeSteps = false;
   this->Controller = nullptr;
+  this->CurrentTimeIndex = 0;
+  this->NumberOfTimeSteps = 1;
   this->SetController(vtkMultiProcessController::GetGlobalController());
+
+
+  //this->ArrayName = nullptr;
+  this->Component = 0;
+  this->LookupTable = nullptr;
+  this->EnableColoring = false;
+  this->EnableAlpha = false;
+  //this->SetArrayName("vtkVDBWriterColors");
 }
 
 //-----------------------------------------------------------------------------
@@ -58,6 +88,7 @@ vtkVDBWriter::~vtkVDBWriter()
 {
   this->SetFileName(nullptr);
   this->SetController(nullptr);
+  //this->SetArrayName(nullptr);
 }
 
 //-----------------------------------------------------------------------------
@@ -80,10 +111,56 @@ int vtkVDBWriter::ProcessRequest(
      inInfo->Set(vtkStreamingDemandDrivenPipeline::UPDATE_PIECE_NUMBER(),
        (this->Controller ? this->Controller->GetLocalProcessId() : 0));
      inInfo->Set(vtkStreamingDemandDrivenPipeline::UPDATE_NUMBER_OF_GHOST_LEVELS(), 0);
-    return 1;
+
+     if (this->WriteAllTimeSteps)
+     {
+       double* inTimes =
+         inputVector[0]->GetInformationObject(0)->Get(vtkStreamingDemandDrivenPipeline::TIME_STEPS());
+       if (inTimes && this->WriteAllTimeSteps)
+       {
+         double timeReq = inTimes[this->CurrentTimeIndex];
+         inputVector[0]->GetInformationObject(0)->Set(
+           vtkStreamingDemandDrivenPipeline::UPDATE_TIME_STEP(), timeReq);
+       }
+     }
+     return 1;
+  }
+  else if (request->Has(vtkStreamingDemandDrivenPipeline::REQUEST_INFORMATION()))
+  {
+    vtkInformation* inInfo = inputVector[0]->GetInformationObject(0);
+    if (inInfo->Has(vtkStreamingDemandDrivenPipeline::TIME_STEPS()))
+    {
+      // reset the CurrentTimeIndex in case we're writing out all of the time steps
+      this->CurrentTimeIndex = 0;
+      this->NumberOfTimeSteps = inInfo->Length(vtkStreamingDemandDrivenPipeline::TIME_STEPS());
+    }
+    else
+    {
+      this->NumberOfTimeSteps = 1;
+    }
+  }
+  else if (request->Has(vtkStreamingDemandDrivenPipeline::REQUEST_DATA()))
+  {
+    if (this->WriteAllTimeSteps && this->CurrentTimeIndex == 0)
+    {
+      // Tell the pipeline to start looping.
+      request->Set(vtkStreamingDemandDrivenPipeline::CONTINUE_EXECUTING(), 1);
+    }
   }
 
-  return this->Superclass::ProcessRequest(request, inputVector, outputVector);
+  int retVal = this->Superclass::ProcessRequest(request, inputVector, outputVector);
+
+  if (request->Has(vtkStreamingDemandDrivenPipeline::REQUEST_DATA()))
+  {
+    if (this->WriteAllTimeSteps && this->CurrentTimeIndex == this->NumberOfTimeSteps)
+    {
+      // Tell the pipeline to stop looping.
+      request->Remove(vtkStreamingDemandDrivenPipeline::CONTINUE_EXECUTING());
+      this->CurrentTimeIndex = 0;
+    }
+  }
+
+  return retVal;
 }
 
 
@@ -106,7 +183,7 @@ void vtkVDBWriter::WriteData()
   {
     this->WritePointSet(pointSet);
   }
-
+  this->CurrentTimeIndex++;
 
 
 }
@@ -114,6 +191,9 @@ void vtkVDBWriter::WriteData()
 //-----------------------------------------------------------------------------
 void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
 {
+
+
+
   std::vector<openvdb::GridBase::Ptr> grids;
 
   double dx(0), dy(0), dz(0);
@@ -144,51 +224,165 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
     }
   }
 
+  openvdb::Coord denseDim(pointExtent[1]-pointExtent[0]+1, pointExtent[3]-pointExtent[2]+1, pointExtent[5]-pointExtent[4]+1);
+  openvdb::Coord denseMin(pointExtent[0], pointExtent[2], pointExtent[4]);
+
   cerr << this->Controller->GetLocalProcessId() << " pointextents " << pointExtent[0] << " " << pointExtent[1] << " " << pointExtent[2] << " " << pointExtent[3] << " " << pointExtent[4] << " " << pointExtent[5] << endl;
 
-
-  for (int array=0;array<imageData->GetPointData()->GetNumberOfArrays();array++)
+  // compute colors, if any
+  vtkNew<vtkPointData> pointData;
+  pointData->ShallowCopy(imageData->GetPointData());
+  vtkNew<vtkCellData> cellData;
+  cellData->ShallowCopy(imageData->GetCellData());
+  if (this->LookupTable && this->EnableColoring)
   {
-    vtkDataArray* data = imageData->GetPointData()->GetArray(array);
-    const char* arrayName = data->GetName();
-    openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create();
-// enum GridClass {
-//     GRID_UNKNOWN = 0,
-//     GRID_LEVEL_SET,
-//     GRID_FOG_VOLUME,
-//     GRID_STAGGERED
-// };
-    grid->setGridClass(openvdb::GRID_FOG_VOLUME);
-    grid->setName(arrayName);
-    openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
-    openvdb::Coord ijk;
-
-    int &i = ijk[0], &j = ijk[1], &k = ijk[2];
-    int vtkijk[3];
-    for(k = pointExtent[4]; k <= pointExtent[5]; ++k)
+    int fieldAssociation = 0;
+    vtkAbstractArray* scalars = this->GetInputAbstractArrayToProcess(0, imageData, fieldAssociation);
+    vtkDiscretizableColorTransferFunction* dctf =
+      vtkDiscretizableColorTransferFunction::SafeDownCast(this->LookupTable);
+    bool enableOpacityMapping = dctf->GetEnableOpacityMapping();
+    dctf->SetEnableOpacityMapping(this->EnableAlpha);
+    vtkUnsignedCharArray* rgba =
+      this->LookupTable->MapScalars(scalars, VTK_COLOR_MODE_MAP_SCALARS, -1);
+    vtkIdType numPoints = imageData->GetNumberOfPoints();
+    if (rgba && rgba->GetNumberOfTuples() == numPoints)
     {
-      vtkijk[2] = k;
-      for(j = pointExtent[2]; j <= pointExtent[3]; ++j)
-      {
-        vtkijk[1] = j;
-        for(i = pointExtent[0]; i <= pointExtent[1]; ++i)
-        {
-          vtkijk[0] = i;
-          //cerr << this->Controller->GetLocalProcessId() << " is writing " << i << " " << j << " " << k << " " << data->GetTuple1(imageData->ComputePointId(vtkijk)) << endl;
-          accessor.setValue(ijk, data->GetTuple1(imageData->ComputePointId(vtkijk)));
-        }
-      }
-
-
-      grid->setTransform(linearTransform);
-
+      this->SetRGBA(numPoints, rgba, pointData);
+      // if (pointColors)
+      // {
+      //   pointColors->SetName("color");
+      //   pointData->AddArray(pointColors);
+      // }
     }
-    grids.push_back(grid);
+    fieldAssociation = 1;
+    scalars = this->GetInputAbstractArrayToProcess(0, imageData, fieldAssociation);
+    dctf = vtkDiscretizableColorTransferFunction::SafeDownCast(this->LookupTable);
+    rgba = this->LookupTable->MapScalars(scalars, VTK_COLOR_MODE_MAP_SCALARS, -1);
+    vtkIdType numCells = imageData->GetNumberOfCells();
+    if (rgba && rgba->GetNumberOfTuples() == numCells)
+    {
+      this->SetRGBA(numCells, rgba, cellData);
+      // if (cellColors)
+      // {
+      //   cellColors->SetName("color");
+      //   cellData->AddArray(cellColors);
+      // }
+    }
+    dctf->SetEnableOpacityMapping(enableOpacityMapping);
   }
 
-  for (int array=0;array<imageData->GetCellData()->GetNumberOfArrays();array++)
+
+
+  for (int array=0;array<pointData->GetNumberOfArrays();array++)
   {
-    vtkDataArray* data = imageData->GetCellData()->GetArray(array);
+    bool useDenseGrid = false;
+    vtkDataArray* data = pointData->GetArray(array);
+    const char* arrayName = data->GetName();
+    const int numberOfComponents = data->GetNumberOfComponents();
+    for (int component=0;component<numberOfComponents;component++)
+    {
+      if (numberOfComponents == 3 && component > 0)
+      {
+        continue;
+      }
+      // Vec3SGrid is sparse but for image data want Vec3DGrid for dense storage for
+      // smaller size
+      openvdb::Vec3DGrid::Ptr vecGrid = openvdb::Vec3DGrid::create();
+      // see https://www.openvdb.org/documentation/doxygen/namespaceopenvdb_1_1v8__0.html#ae93f92d10730a52ed3b207d5811f6a6e
+      if (strcmp(arrayName, "color"))
+      {
+        vecGrid->setVectorType(openvdb::VEC_CONTRAVARIANT_RELATIVE);
+      }
+      else
+      {
+        vecGrid->setVectorType(openvdb::VEC_INVARIANT);
+      }
+      vecGrid->setGridClass(openvdb::GRID_FOG_VOLUME);
+
+
+      openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create();
+      // enum GridClass {
+      //     GRID_UNKNOWN = 0,
+      //     GRID_LEVEL_SET,
+      //     GRID_FOG_VOLUME,
+      //     GRID_STAGGERED
+      // };
+      grid->setGridClass(openvdb::GRID_FOG_VOLUME);
+      //auto denseGrid = new openvdb::tools::Dense(denseDim, denseMin);
+      // openvdb::tools::Dense<float>::Ptr pp;
+      // auto grid222 = openvdb::FloatGrid::createGrid<openvdb::tools::Dense<float> >();
+      // const openvdb::CoordBBox bbox(openvdb::Coord(pointExtent[0], pointExtent[2], pointExtent[4]),
+      //                               openvdb::Coord(pointExtent[1]+1, pointExtent[3]+1, pointExtent[5]+1));
+      // openvdb::tools::Dense<float>* d = new openvdb::tools::Dense<float>(bbox);
+      // //openvdb::tools::Dense<float>* d = new openvdb::tools::Dense<float>(bbox);
+      // //openvdb::tools::Dense<float>::Ptr denseGrid(d);
+      // auto denseGrid = std::make_shared<openvdb::tools::Dense<float>* >(d);
+
+      std::string vdbName = GetVDBGridName(arrayName, component, numberOfComponents);
+      grid->setName(vdbName);
+      vecGrid->setName(vdbName);
+      //denseGrid->setName(vdbName);
+      openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
+      openvdb::Vec3DGrid::Accessor vecAccessor = vecGrid->getAccessor();
+      //auto denseAccessor = denseGrid->getAccessor();
+      openvdb::Coord ijk;
+
+      int &i = ijk[0], &j = ijk[1], &k = ijk[2];
+      int vtkijk[3];
+      for(k = pointExtent[4]; k <= pointExtent[5]; ++k)
+      {
+        vtkijk[2] = k;
+        for(j = pointExtent[2]; j <= pointExtent[3]; ++j)
+        {
+          vtkijk[1] = j;
+          for(i = pointExtent[0]; i <= pointExtent[1]; ++i)
+          {
+            vtkijk[0] = i;
+            if (numberOfComponents == 3)
+            {
+              double tuple[3];
+              data->GetTuple(imageData->ComputePointId(vtkijk), tuple);
+              openvdb::Vec3f ftuple(tuple[0], tuple[1], tuple[2]);
+              vecAccessor.setValue(ijk, ftuple);
+            }
+            else
+            {
+              if (useDenseGrid)
+              {
+                //denseAccessor.setValue(ijk, data->GetComponent(imageData->ComputePointId(vtkijk), component));
+              }
+              else
+              {
+                accessor.setValue(ijk, data->GetComponent(imageData->ComputePointId(vtkijk), component));
+              }
+            }
+          }
+        }
+      grid->setTransform(linearTransform);
+      //denseGrid->setTransform(linearTransform);
+      vecGrid->setTransform(linearTransform);
+      }
+      if (numberOfComponents == 3)
+      {
+        grids.push_back(vecGrid);
+      }
+      else
+      {
+        if (useDenseGrid)
+        {
+          //grids.push_back(denseGrid);
+        }
+        else
+        {
+          grids.push_back(grid);
+        }
+      }
+    }
+  }
+
+  for (int array=0;array<cellData->GetNumberOfArrays();array++)
+  {
+    vtkDataArray* data = cellData->GetArray(array);
     const char* arrayName = data->GetName();
     openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create();
 // enum GridClass {
@@ -204,7 +398,7 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
 
     vtkIdType counter = 0;
     int &i = ijk[0], &j = ijk[1], &k = ijk[2];
-    // for cell data we don't have to worry ghost cells. hopefully they're gone in parallel. -- check this ACB
+    // for cell data we don't have to worry about ghost cells. hopefully they're gone in parallel. -- check this ACB
     for(k = extent[4]; k < extent[5]; ++k)
     {
       for(j = extent[2]; j < extent[3]; ++j)
@@ -260,16 +454,39 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
 
   //openvdb::io::File(output.data()).write({grid});
   //openvdb::io::File(this->FileName).write({grid});
+  std::ostringstream oss;
+  oss << std::setw(5) << std::setfill('0') << this->CurrentTimeIndex;
   if (this->Controller->GetNumberOfProcesses() == 1)
   {
-    openvdb::io::File(this->FileName).write(grids);
+    if (this->WriteAllTimeSteps && this->NumberOfTimeSteps > 1)
+    {
+      std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(this->FileName);
+      std::string ext = vtksys::SystemTools::GetFilenameExtension(this->FileName);
+      std::string newFileName = fileNameBase+"_"+oss.str()+ext;
+      openvdb::io::File(newFileName).write(grids);
+    }
+    else
+    {
+      openvdb::io::File(this->FileName).write(grids);
+    }
   }
   else
   {
-    std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(this->FileName);
-    std::string ext = vtksys::SystemTools::GetFilenameExtension(this->FileName);
-    std::string newFileName = fileNameBase+"_"+std::to_string(this->Controller->GetLocalProcessId())+ext;
-    openvdb::io::File(newFileName).write(grids);
+    if (this->WriteAllTimeSteps && this->NumberOfTimeSteps > 1)
+    {
+      std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(this->FileName);
+      std::string ext = vtksys::SystemTools::GetFilenameExtension(this->FileName);
+      std::string newFileName = fileNameBase+"_"+std::to_string(this->Controller->GetLocalProcessId())+
+        "_"+oss.str()+ext;
+      openvdb::io::File(newFileName).write(grids);
+    }
+    else
+    {
+      std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(this->FileName);
+      std::string ext = vtksys::SystemTools::GetFilenameExtension(this->FileName);
+      std::string newFileName = fileNameBase+"_"+std::to_string(this->Controller->GetLocalProcessId())+ext;
+      openvdb::io::File(newFileName).write(grids);
+    }
   }
 }
 
@@ -368,13 +585,77 @@ void vtkVDBWriter::WritePointSet(vtkPointSet* pointSet)
   }
 }
 
+//-----------------------------------------------------------------------------
+void vtkVDBWriter::SetRGBA(
+  vtkIdType num, vtkUnsignedCharArray* rgbaArray, vtkDataSetAttributes* attributes)
+{
+  vtkIdType i;
 
+  int numComp = rgbaArray->GetNumberOfComponents();
+  if (numComp == 3)
+  { // have unsigned char array of three components, copy it
+    rgbaArray->SetName("color");
+    attributes->AddArray(rgbaArray);
+    if (this->EnableAlpha)
+    {
+      vtkWarningMacro("No alpha channel to set even though requested");
+    }
+    return;
+  }
+  else if (numComp == 4)
+  {
+    // have unsigned char array of four components (RGBA), copy it without the `A`.
+    vtkSmartPointer<vtkFloatArray> colors = vtkSmartPointer<vtkFloatArray>::New();
+    colors->SetNumberOfComponents(3);
+    colors->SetNumberOfTuples(num);
+    colors->SetName("color");
+    float* c = colors->WritePointer(0, 3 * num);
+    vtkSmartPointer<vtkFloatArray> alpha = vtkSmartPointer<vtkFloatArray>::New();
+    alpha->SetNumberOfComponents(1);
+    alpha->SetNumberOfTuples(num);
+    alpha->SetName("alpha");
+    float* a = alpha->WritePointer(0, num);
+    const unsigned char* rgba = rgbaArray->GetPointer(0);
+    for (i = 0; i < num; i++)
+    {
+      *c++ = (*rgba++)/255.;
+      *c++ = (*rgba++)/255.;
+      *c++ = (*rgba++)/255.;
+      *a++ = (*rgba++)/255.;
+    }
+    attributes->AddArray(colors);
+    if (this->EnableAlpha)
+    {
+      attributes->AddArray(alpha);
+    }
+    return;
+  }
+  // else if (this->LookupTable != nullptr)
+  // { // use the data array mapped through lookup table
+  //   vtkSmartPointer<vtkUnsignedCharArray> colors = vtkSmartPointer<vtkUnsignedCharArray>::New();
+  //   colors->SetNumberOfComponents(3);
+  //   colors->SetNumberOfTuples(num);
+  //   c = colors->WritePointer(0, 3 * num);
+  //   for (i = 0; i < num; i++)
+  //   {
+  //     double* tuple = da->GetTuple(i);
+  //     const unsigned char* rgb = this->LookupTable->MapValue(tuple[this->Component]);
+  //     *c++ = rgb[0];
+  //     *c++ = rgb[1];
+  //     *c++ = rgb[2];
+  //   }
+  //   return colors;
+  // }
+  // no lookup table
+  return;
+}
 
 //-----------------------------------------------------------------------------
 void vtkVDBWriter::PrintSelf(ostream& os, vtkIndent indent)
 {
   this->Superclass::PrintSelf(os, indent);
   os << indent << "FileName: " << (this->FileName ? this->FileName : "none") << endl;
+  os << indent << "WriteAllTimeSteps: " << this->WriteAllTimeSteps << endl;
   if (this->Controller)
   {
     os << indent << "Controller: " << this->Controller << endl;

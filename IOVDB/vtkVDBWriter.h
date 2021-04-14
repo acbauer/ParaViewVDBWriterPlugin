@@ -15,18 +15,23 @@
 /**
  * @class   vtkVDBWriter
  * @brief   VDB writer for vtkImageData or vtkPointSet
- * Writes a vtkImageData or vtkPointSet as a VDB file.
+ * Writes a vtkImageData or vtkPointSEt as a VDB file.
 */
 
 #ifndef vtkVDBWriter_h
 #define vtkVDBWriter_h
 
 #include "vtkVDBWritersModule.h" //needed for exports
+#include "vtkSmartPointer.h" // For protected ivars
 #include "vtkWriter.h"
+#include <string>
 
+class vtkDataSetAttributes;
 class vtkImageData;
-class vtkPointSet;
 class vtkMultiProcessController;
+class vtkPointSet;
+class vtkScalarsToColors;
+class vtkUnsignedCharArray;
 
 class VTKVDBWRITERS_EXPORT vtkVDBWriter : public vtkWriter
 {
@@ -41,6 +46,57 @@ public:
    */
   vtkSetStringMacro(FileName);
   vtkGetStringMacro(FileName);
+  //@}
+
+  //@{
+  /**
+   * Get/Set whether or not to save all time steps or
+   * just the current time step. Default is false
+   * (save only the current time step).
+   */
+  vtkSetMacro(WriteAllTimeSteps, bool);
+  vtkGetMacro(WriteAllTimeSteps, bool);
+  //@}
+
+  //@{
+  /**
+   * A lookup table can be specified in order to convert data arrays to
+   * RGBA colors.
+   */
+  virtual void SetLookupTable(vtkScalarsToColors*);
+  vtkGetObjectMacro(LookupTable, vtkScalarsToColors);
+  //@}
+
+  //@{
+  /**
+   * Specify the array name to use to color the data.
+   */
+  /* vtkSetStringMacro(ArrayName); */
+  /* vtkGetStringMacro(ArrayName); */
+  //@}
+
+  //@{
+  /**
+   * Specify the array component to use to color the data.
+   */
+  vtkSetClampMacro(Component, int, 0, VTK_INT_MAX);
+  vtkGetMacro(Component, int);
+  //@}
+
+  //@{
+  /**
+   * Enable coloring.
+   */
+  vtkSetMacro(EnableColoring, bool);
+  vtkGetMacro(EnableColoring, bool);
+  //@}
+
+  //@{
+  /**
+   * Enable coloring.
+   */
+  vtkSetMacro(EnableAlpha, bool);
+  vtkGetMacro(EnableAlpha, bool);
   //@}
 
   //@{
@@ -70,13 +126,33 @@ protected:
   int ProcessRequest(vtkInformation* request, vtkInformationVector** inputVector,
     vtkInformationVector* outputVector) override;
 
+  void SetRGBA(vtkIdType num, vtkUnsignedCharArray* rgba, vtkDataSetAttributes* attributes);
+
+
   char* FileName;
+
+  bool WriteAllTimeSteps;
+
+  // For outputting the Lookup Table in the VDB file.
+  // Copying what's done in vtkPLYWriter
+  //char* ArrayName;
+  std::string ArrayName;
+  int Component;
+  vtkScalarsToColors* LookupTable;
+  bool EnableColoring;
+  bool EnableAlpha;
+
 
 private:
   vtkVDBWriter(const vtkVDBWriter&) = delete;
   void operator=(const vtkVDBWriter&) = delete;
 
   vtkMultiProcessController* Controller;
+  // Internal variable to keep track of the current time step index
+  // when writing out all the time steps.
+  vtkIdType CurrentTimeIndex;
+  // Internal variable to keep track of the number of time steps.
+  vtkIdType NumberOfTimeSteps;
 
   //class VDBFile;
 };

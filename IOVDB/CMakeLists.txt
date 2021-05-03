@@ -28,6 +28,7 @@
 #  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 #==========================================================================
+# the following line needs to point to where the FindBlosc.cmake, FindOpenVDB.cmake, OpenVDBUtils.cmake, etc. are located.
 list(APPEND CMAKE_MODULE_PATH "/home/acbauer/Code/OpenVDB/install/lib64/cmake/OpenVDB")
 find_package(OpenVDB REQUIRED)
 

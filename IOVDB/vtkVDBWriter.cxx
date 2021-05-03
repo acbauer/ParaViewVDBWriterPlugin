@@ -14,6 +14,7 @@
 =========================================================================*/
 #include "vtkVDBWriter.h"
 
+#include "vtkCellCenters.h"
 #include "vtkCellData.h"
 #include "vtkCommunicator.h"
 #include "vtkDiscretizableColorTransferFunction.h"
@@ -21,7 +22,6 @@
 #include "vtkImageData.h"
 #include "vtkInformation.h"
 #include "vtkInformationVector.h"
-#include "vtkMath.h"
 #include "vtkMultiProcessController.h"
 #include "vtkObjectFactory.h"
 #include "vtkPointData.h"
@@ -31,7 +31,6 @@
 #include "vtkStreamingDemandDrivenPipeline.h"
 #include "vtkUnsignedCharArray.h"
 
-#include "vtksys/FStream.hxx"
 #include <vtksys/SystemTools.hxx>
 
 #include <algorithm>
@@ -57,11 +56,243 @@ std::string GetVDBGridName(const char* arrayName, int component, int numberOfCom
   return vdbName;
 }
 
+
+void WriteVDBGrids(std::vector<openvdb::GridBase::Ptr>& grids, vtkMultiProcessController* controller, const char* fileName,
+                   bool writeAllTimeSteps, vtkIdType numberOfTimeSteps, vtkIdType currentTimeIndex)
+{
+  std::ostringstream oss;
+  oss << std::setw(5) << std::setfill('0') << currentTimeIndex;
+  if (controller->GetNumberOfProcesses() == 1)
+  {
+    if (writeAllTimeSteps && numberOfTimeSteps > 1)
+    {
+      std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(fileName);
+      std::string ext = vtksys::SystemTools::GetFilenameExtension(fileName);
+      std::string newFileName = fileNameBase+"_"+oss.str()+ext;
+      openvdb::io::File(newFileName).write(grids);
+    }
+    else
+    {
+      openvdb::io::File(fileName).write(grids);
+    }
+  }
+  else
+  {
+    if (writeAllTimeSteps && numberOfTimeSteps > 1)
+    {
+      std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(fileName);
+      std::string ext = vtksys::SystemTools::GetFilenameExtension(fileName);
+      std::string newFileName = fileNameBase+"_"+std::to_string(controller->GetLocalProcessId())+
+        "_"+oss.str()+ext;
+      openvdb::io::File(newFileName).write(grids);
+    }
+    else
+    {
+      std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(fileName);
+      std::string ext = vtksys::SystemTools::GetFilenameExtension(fileName);
+      std::string newFileName = fileNameBase+"_"+std::to_string(controller->GetLocalProcessId())+ext;
+      openvdb::io::File(newFileName).write(grids);
+    }
+  }
 }
+
+} // end anonymous namespace
+
+class vtkVDBWriterInternals
+{
+public:
+  vtkVDBWriterInternals(vtkVDBWriter* writer)
+    {
+      this->Writer = writer;
+    }
+  vtkVDBWriter* Writer;
+
+
+  openvdb::points::PointDataGrid::Ptr ProcessPointSet(vtkPointSet* pointSet, const char* gridName)
+    {
+      vtkIdType numPoints = pointSet->GetNumberOfPoints();
+
+      // compute colors, if any
+      vtkNew<vtkPointData> pointData;
+      pointData->ShallowCopy(pointSet->GetPointData());
+      vtkNew<vtkCellData> cellData;
+      cellData->ShallowCopy(pointSet->GetCellData());
+      if (this->Writer->LookupTable && this->Writer->EnableColoring)
+      {
+        int fieldAssociation = 0;
+        vtkAbstractArray* scalars = this->Writer->GetInputAbstractArrayToProcess(0, pointSet, fieldAssociation);
+        vtkDiscretizableColorTransferFunction* dctf =
+          vtkDiscretizableColorTransferFunction::SafeDownCast(this->Writer->LookupTable);
+        bool enableOpacityMapping = dctf->GetEnableOpacityMapping();
+        dctf->SetEnableOpacityMapping(this->Writer->EnableAlpha);
+        vtkUnsignedCharArray* rgba =
+          this->Writer->LookupTable->MapScalars(scalars, VTK_COLOR_MODE_MAP_SCALARS, -1);
+        if (rgba && rgba->GetNumberOfTuples() == numPoints)
+        {
+          this->Writer->SetRGBA(numPoints, rgba, pointData);
+        }
+        fieldAssociation = 1;
+        scalars = this->Writer->GetInputAbstractArrayToProcess(0, pointSet, fieldAssociation);
+        dctf = vtkDiscretizableColorTransferFunction::SafeDownCast(this->Writer->LookupTable);
+        rgba = this->Writer->LookupTable->MapScalars(scalars, VTK_COLOR_MODE_MAP_SCALARS, -1);
+        vtkIdType numCells = pointSet->GetNumberOfCells();
+        if (rgba && rgba->GetNumberOfTuples() == numCells)
+        {
+          this->Writer->SetRGBA(numCells, rgba, cellData);
+        }
+        dctf->SetEnableOpacityMapping(enableOpacityMapping);
+      }
+
+
+      std::vector<openvdb::Vec3R> positions;
+      double coord[3];
+      for (vtkIdType i=0;i<pointSet->GetNumberOfPoints();i++)
+      {
+        pointSet->GetPoint(i, coord);
+        positions.push_back(openvdb::Vec3R(static_cast<float>(coord[0]),
+                                           static_cast<float>(coord[1]),
+                                           static_cast<float>(coord[2])));
+      }
+
+      // The VDB Point-Partioner is used when bucketing points and requires a
+      // specific interface. For convenience, we use the PointAttributeVector
+      // wrapper around an stl vector wrapper here, however it is also possible to
+      // write one for a custom data structure in order to match the interface
+      // required.
+      openvdb::points::PointAttributeVector<openvdb::Vec3R> positionsWrapper(positions);
+      // This method computes a voxel-size to match the number of
+      // points / voxel requested. Although it won't be exact, it typically offers
+      // a good balance of memory against performance.
+      int pointsPerVoxel = 8;
+      float voxelSize =
+        openvdb::points::computeVoxelSize(positionsWrapper, pointsPerVoxel);
+      // Create a transform using this voxel-size.
+      openvdb::math::Transform::Ptr transform =
+        openvdb::math::Transform::createLinearTransform(voxelSize);
+      // Create a PointIndexGrid. This can be done automatically on creation of
+      // the grid, however as this index grid is required for the position and
+      // radius attributes, we create one we can use for both attribute creation.
+      openvdb::tools::PointIndexGrid::Ptr pointIndexGrid =
+    openvdb::tools::createPointIndexGrid<openvdb::tools::PointIndexGrid>(
+      positionsWrapper, *transform);
+      // Create a PointDataGrid containing these four points and using the point
+      // index grid. This requires the positions wrapper.
+      openvdb::points::PointDataGrid::Ptr grid =
+        openvdb::points::createPointDataGrid<openvdb::points::NullCodec,
+                                             openvdb::points::PointDataGrid>(*pointIndexGrid, positionsWrapper, *transform);
+
+      // Set the name of the grid
+      grid->setName(gridName);
+
+
+      for (int array=0;array<pointData->GetNumberOfArrays();array++)
+      {
+        vtkDataArray* data = pointData->GetArray(array);
+        const char* arrayName = data->GetName();
+        const int numberOfComponents = data->GetNumberOfComponents();
+        for (int component=0;component<numberOfComponents;component++)
+        {
+          if (numberOfComponents == 3 && component > 0)
+          {
+            continue;
+          }
+          std::string vdbName = GetVDBGridName(arrayName, component, numberOfComponents);
+          //cerr << "adding pointset vdbName " << vdbName << endl;
+
+          // Append a data->GetName() attribute to the grid to hold the radius.
+          // This attribute storage uses a unit range codec to reduce the memory
+          // storage requirements down from 4-bytes to just 1-byte per value. This is
+          // only possible because accuracy of the radius is not that important to us
+          // and the values are always within unit range (0.0 => 1.0).
+          // Note that this attribute type is not registered by default so needs to be
+          // explicitly registered.
+          // using Codec = openvdb::points::FixedPointCodec</*1-byte=*/false,
+          //         openvdb::points::UnitRange>;
+          // openvdb::points::TypedAttributeArray<float, Codec>::registerType();
+          if (numberOfComponents == 3)
+          {
+            std::vector<openvdb::Vec3f> values;
+            for (vtkIdType i=0;i<numPoints;i++)
+            {
+              double tuple[3];
+              data->GetTuple(i, tuple);
+              openvdb::Vec3f ftuple(tuple[0], tuple[1], tuple[2]);
+              values.push_back(ftuple);
+            }
+            openvdb::NamePair vectorAttribute =
+              openvdb::points::TypedAttributeArray<openvdb::Vec3f, openvdb::points::NullCodec>::attributeType();
+            openvdb::points::appendAttribute(grid->tree(), vdbName, vectorAttribute);
+            // Create a wrapper around the values vector.
+            openvdb::points::PointAttributeVector<openvdb::Vec3f> valuesWrapper(values);
+            // Populate the data->GetName() attribute on the points
+            openvdb::points::populateAttribute<openvdb::points::PointDataTree,
+                                               openvdb::tools::PointIndexTree, openvdb::points::PointAttributeVector<openvdb::Vec3f>>(
+                                                 grid->tree(), pointIndexGrid->tree(), vdbName, valuesWrapper);
+          }
+          else
+          {
+            std::vector<float> values;
+            for (vtkIdType i=0;i<numPoints;i++)
+            {
+              values.push_back(static_cast<float>(data->GetComponent(i, component)));
+            }
+            openvdb::NamePair scalarAttribute =
+              openvdb::points::TypedAttributeArray<float, openvdb::points::NullCodec>::attributeType();
+            openvdb::points::appendAttribute(grid->tree(), vdbName, scalarAttribute);
+            // Create a wrapper around the values vector.
+            openvdb::points::PointAttributeVector<float> valuesWrapper(values);
+            // Populate the data->GetName() attribute on the points
+            openvdb::points::populateAttribute<openvdb::points::PointDataTree,
+                                               openvdb::tools::PointIndexTree, openvdb::points::PointAttributeVector<float>>(
+                                                 grid->tree(), pointIndexGrid->tree(), vdbName, valuesWrapper);
+          }
+        } // iterate over number of components
+      } // iterate over point arrays
+
+
+      double bounds[6], center[3];;
+      pointSet->GetBounds(bounds);
+      pointSet->GetCenter(center);
+
+      double globalBounds[6] = {bounds[0], bounds[1], bounds[2], bounds[3], bounds[4], bounds[5]};
+      double globalCenter[3] = {center[0], center[1], center[2]};
+      if (this->Writer->Controller->GetNumberOfProcesses() > 1)
+      {
+        globalBounds[0] = -globalBounds[0];
+        globalBounds[2] = -globalBounds[2];
+        globalBounds[4] = -globalBounds[4];
+        double tmp[6];
+        this->Writer->Controller->AllReduce(globalBounds, tmp, 6, vtkCommunicator::MAX_OP);
+        for(int i=0;i<3;i++)
+        {
+          globalBounds[2*i] = tmp[2*i];
+          globalBounds[2*i+1] = -tmp[2*i+1];
+          globalCenter[i] = .5*(globalBounds[2*i]+globalBounds[2*i+1]);
+        }
+      }
+
+      grid->insertMeta("center",  openvdb::Vec3SMetadata(openvdb::Vec3f(center)));
+      grid->insertMeta("global center",  openvdb::Vec3SMetadata(openvdb::Vec3f(globalCenter)));
+      grid->insertMeta("min bounds",  openvdb::Vec3SMetadata(openvdb::Vec3f(bounds[0], bounds[2], bounds[4])));
+      grid->insertMeta("max bounds",  openvdb::Vec3SMetadata(openvdb::Vec3f(bounds[1], bounds[3], bounds[5])));
+      grid->insertMeta("global min bounds",  openvdb::Vec3SMetadata(openvdb::Vec3f(globalBounds[0], globalBounds[2], globalBounds[4])));
+      grid->insertMeta("global max bounds",  openvdb::Vec3SMetadata(openvdb::Vec3f(globalBounds[1], globalBounds[3], globalBounds[5])));
+      if (pointSet->GetInformation()->Has(vtkDataObject::DATA_TIME_STEP()))
+      {
+        double time = pointSet->GetInformation()->Get(vtkDataObject::DATA_TIME_STEP());
+        grid->insertMeta("time", openvdb::DoubleMetadata(time));
+      }
+
+      return grid;
+    }
+}; // end of vtkVDBWriterInternals class
+
+
 
 vtkStandardNewMacro(vtkVDBWriter);
 vtkCxxSetObjectMacro(vtkVDBWriter, Controller, vtkMultiProcessController);
 vtkCxxSetObjectMacro(vtkVDBWriter, LookupTable, vtkScalarsToColors);
+
 //-----------------------------------------------------------------------------
 vtkVDBWriter::vtkVDBWriter()
 {
@@ -74,13 +305,10 @@ vtkVDBWriter::vtkVDBWriter()
   this->NumberOfTimeSteps = 1;
   this->SetController(vtkMultiProcessController::GetGlobalController());
 
-
-  //this->ArrayName = nullptr;
-  this->Component = 0;
   this->LookupTable = nullptr;
   this->EnableColoring = false;
   this->EnableAlpha = false;
-  //this->SetArrayName("vtkVDBWriterColors");
+  this->Internals = new vtkVDBWriterInternals(this);
 }
 
 //-----------------------------------------------------------------------------
@@ -88,7 +316,7 @@ vtkVDBWriter::~vtkVDBWriter()
 {
   this->SetFileName(nullptr);
   this->SetController(nullptr);
-  //this->SetArrayName(nullptr);
+  delete this->Internals;
 }
 
 //-----------------------------------------------------------------------------
@@ -163,18 +391,9 @@ int vtkVDBWriter::ProcessRequest(
   return retVal;
 }
 
-
-
 //-----------------------------------------------------------------------------
 void vtkVDBWriter::WriteData()
 {
-  // double time = vtkMath::Nan();
-  // if (this->AddTime && input && input->GetInformation()->Has(vtkDataObject::DATA_TIME_STEP()))
-  // {
-  //   time = input->GetInformation()->Get(vtkDataObject::DATA_TIME_STEP());
-  // }
-
-
   if (vtkImageData* imageData = vtkImageData::SafeDownCast(this->GetInput()))
   {
     this->WriteImageData(imageData);
@@ -184,21 +403,17 @@ void vtkVDBWriter::WriteData()
     this->WritePointSet(pointSet);
   }
   this->CurrentTimeIndex++;
-
-
 }
 
 //-----------------------------------------------------------------------------
 void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
 {
-
-
-
   std::vector<openvdb::GridBase::Ptr> grids;
 
   double dx(0), dy(0), dz(0);
   imageData->GetSpacing(dx, dy, dz);
 
+  // mat and linearTransform are used to transform our voxel geometry to the proper shape
   openvdb::math::Mat4d mat(dx, 0., 0., 0.,
                            0., dy, 0., 0.,
                            0., 0., dz, 0.,
@@ -224,10 +439,25 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
     }
   }
 
-  openvdb::Coord denseDim(pointExtent[1]-pointExtent[0]+1, pointExtent[3]-pointExtent[2]+1, pointExtent[5]-pointExtent[4]+1);
-  openvdb::Coord denseMin(pointExtent[0], pointExtent[2], pointExtent[4]);
-
-  cerr << this->Controller->GetLocalProcessId() << " pointextents " << pointExtent[0] << " " << pointExtent[1] << " " << pointExtent[2] << " " << pointExtent[3] << " " << pointExtent[4] << " " << pointExtent[5] << endl;
+  double bounds[6], center[3];
+  imageData->GetBounds(bounds);
+  imageData->GetCenter(center);
+  double globalBounds[6] = {bounds[0], bounds[1], bounds[2], bounds[3], bounds[4], bounds[5]};
+  double globalCenter[3] = {center[0], center[1], center[2]};
+  if (this->Controller->GetNumberOfProcesses() > 1)
+  {
+    globalBounds[0] = -globalBounds[0];
+    globalBounds[2] = -globalBounds[2];
+    globalBounds[4] = -globalBounds[4];
+    double tmp[6];
+    this->Controller->AllReduce(globalBounds, tmp, 6, vtkCommunicator::MAX_OP);
+    for(int i=0;i<3;i++)
+    {
+      globalBounds[2*i] = tmp[2*i];
+      globalBounds[2*i+1] = -tmp[2*i+1];
+      globalCenter[i] = .5*(globalBounds[2*i]+globalBounds[2*i+1]);
+    }
+  }
 
   // compute colors, if any
   vtkNew<vtkPointData> pointData;
@@ -248,11 +478,6 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
     if (rgba && rgba->GetNumberOfTuples() == numPoints)
     {
       this->SetRGBA(numPoints, rgba, pointData);
-      // if (pointColors)
-      // {
-      //   pointColors->SetName("color");
-      //   pointData->AddArray(pointColors);
-      // }
     }
     fieldAssociation = 1;
     scalars = this->GetInputAbstractArrayToProcess(0, imageData, fieldAssociation);
@@ -262,20 +487,32 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
     if (rgba && rgba->GetNumberOfTuples() == numCells)
     {
       this->SetRGBA(numCells, rgba, cellData);
-      // if (cellColors)
-      // {
-      //   cellColors->SetName("color");
-      //   cellData->AddArray(cellColors);
-      // }
     }
     dctf->SetEnableOpacityMapping(enableOpacityMapping);
   }
 
-
+  vtkUnsignedCharArray* pointGhostType =
+    vtkUnsignedCharArray::SafeDownCast(pointData->GetArray("vtkGhostType"));
+  if (pointGhostType && pointGhostType->GetRange(0)[1] == 0)
+  {
+    pointGhostType = nullptr; // no ghosts
+  }
+  vtkUnsignedCharArray* cellGhostType =
+    vtkUnsignedCharArray::SafeDownCast(cellData->GetArray("vtkGhostType"));
+  if (cellGhostType && cellGhostType->GetRange(0)[1] == 0)
+  {
+    cellGhostType = nullptr; // no ghosts
+  }
+  bool needToUpdateBoundsAndCenter = false;
+  if (pointGhostType && cellGhostType)
+  {
+    needToUpdateBoundsAndCenter = true;
+    bounds[0] = bounds[2] = bounds[4] = VTK_DOUBLE_MAX;
+    bounds[1] = bounds[3] = bounds[5] = VTK_DOUBLE_MIN;
+  }
 
   for (int array=0;array<pointData->GetNumberOfArrays();array++)
   {
-    bool useDenseGrid = false;
     vtkDataArray* data = pointData->GetArray(array);
     const char* arrayName = data->GetName();
     const int numberOfComponents = data->GetNumberOfComponents();
@@ -285,9 +522,8 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
       {
         continue;
       }
-      // Vec3SGrid is sparse but for image data want Vec3DGrid for dense storage for
-      // smaller size
-      openvdb::Vec3DGrid::Ptr vecGrid = openvdb::Vec3DGrid::create();
+      // Vec3SGrid is single precision and Vec3DGrid is for double precision
+      openvdb::Vec3SGrid::Ptr vecGrid = openvdb::Vec3SGrid::create();
       // see https://www.openvdb.org/documentation/doxygen/namespaceopenvdb_1_1v8__0.html#ae93f92d10730a52ed3b207d5811f6a6e
       if (strcmp(arrayName, "color"))
       {
@@ -308,23 +544,11 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
       //     GRID_STAGGERED
       // };
       grid->setGridClass(openvdb::GRID_FOG_VOLUME);
-      //auto denseGrid = new openvdb::tools::Dense(denseDim, denseMin);
-      // openvdb::tools::Dense<float>::Ptr pp;
-      // auto grid222 = openvdb::FloatGrid::createGrid<openvdb::tools::Dense<float> >();
-      // const openvdb::CoordBBox bbox(openvdb::Coord(pointExtent[0], pointExtent[2], pointExtent[4]),
-      //                               openvdb::Coord(pointExtent[1]+1, pointExtent[3]+1, pointExtent[5]+1));
-      // openvdb::tools::Dense<float>* d = new openvdb::tools::Dense<float>(bbox);
-      // //openvdb::tools::Dense<float>* d = new openvdb::tools::Dense<float>(bbox);
-      // //openvdb::tools::Dense<float>::Ptr denseGrid(d);
-      // auto denseGrid = std::make_shared<openvdb::tools::Dense<float>* >(d);
-
       std::string vdbName = GetVDBGridName(arrayName, component, numberOfComponents);
       grid->setName(vdbName);
       vecGrid->setName(vdbName);
-      //denseGrid->setName(vdbName);
       openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
-      openvdb::Vec3DGrid::Accessor vecAccessor = vecGrid->getAccessor();
-      //auto denseAccessor = denseGrid->getAccessor();
+      openvdb::Vec3SGrid::Accessor vecAccessor = vecGrid->getAccessor();
       openvdb::Coord ijk;
 
       int &i = ijk[0], &j = ijk[1], &k = ijk[2];
@@ -338,85 +562,173 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
           for(i = pointExtent[0]; i <= pointExtent[1]; ++i)
           {
             vtkijk[0] = i;
-            if (numberOfComponents == 3)
+            vtkIdType pointId = imageData->ComputePointId(vtkijk);
+            if (needToUpdateBoundsAndCenter && pointGhostType)
             {
-              double tuple[3];
-              data->GetTuple(imageData->ComputePointId(vtkijk), tuple);
-              openvdb::Vec3f ftuple(tuple[0], tuple[1], tuple[2]);
-              vecAccessor.setValue(ijk, ftuple);
-            }
-            else
-            {
-              if (useDenseGrid)
+              if (pointGhostType->GetTuple1(pointId) == 0)
               {
-                //denseAccessor.setValue(ijk, data->GetComponent(imageData->ComputePointId(vtkijk), component));
+                double coords[3];
+                imageData->GetPoint(pointId, coords);
+                for (int c=0;c<3;c++)
+                {
+                  if (coords[c] < bounds[2*c])
+                  {
+                    bounds[2*c] = coords[c];
+                  }
+                  if (coords[c] > bounds[2*c+1])
+                  {
+                    bounds[2*c+1] = coords[c];
+                  }
+                }
+              }
+            }
+
+            if (!pointGhostType || pointGhostType->GetTuple1(pointId) == 0)
+            {
+              if (numberOfComponents == 3)
+              {
+                double tuple[3];
+                data->GetTuple(pointId, tuple);
+                openvdb::Vec3f ftuple(tuple[0], tuple[1], tuple[2]);
+                vecAccessor.setValue(ijk, ftuple);
               }
               else
               {
-                accessor.setValue(ijk, data->GetComponent(imageData->ComputePointId(vtkijk), component));
+                accessor.setValue(ijk, data->GetComponent(pointId, component));
               }
             }
           }
         }
-      grid->setTransform(linearTransform);
-      //denseGrid->setTransform(linearTransform);
-      vecGrid->setTransform(linearTransform);
       }
+
+
+
+      grid->setTransform(linearTransform);
+      vecGrid->setTransform(linearTransform);
+
       if (numberOfComponents == 3)
       {
         grids.push_back(vecGrid);
       }
       else
       {
-        if (useDenseGrid)
-        {
-          //grids.push_back(denseGrid);
-        }
-        else
-        {
-          grids.push_back(grid);
-        }
+        grids.push_back(grid);
       }
     }
   }
+
+  // find the cell size so that we can determine the location of its center
+  // and then figure out the bounds but only do this if we need to
+  // update the bounds and center
+  double halfCellSize[3] = {dx/2., dy/2., dz/2.};
 
   for (int array=0;array<cellData->GetNumberOfArrays();array++)
   {
     vtkDataArray* data = cellData->GetArray(array);
     const char* arrayName = data->GetName();
-    openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create();
-// enum GridClass {
-//     GRID_UNKNOWN = 0,
-//     GRID_LEVEL_SET,
-//     GRID_FOG_VOLUME,
-//     GRID_STAGGERED
-// };
-    grid->setGridClass(openvdb::GRID_FOG_VOLUME);
-    grid->setName(arrayName);
-    openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
-    openvdb::Coord ijk;
-
-    vtkIdType counter = 0;
-    int &i = ijk[0], &j = ijk[1], &k = ijk[2];
-    // for cell data we don't have to worry about ghost cells. hopefully they're gone in parallel. -- check this ACB
-    for(k = extent[4]; k < extent[5]; ++k)
+    const int numberOfComponents = data->GetNumberOfComponents();
+    for (int component=0;component<numberOfComponents;component++)
     {
-      for(j = extent[2]; j < extent[3]; ++j)
+      if (numberOfComponents == 3 && component > 0)
       {
-        for(i = extent[0]; i < extent[1]; ++i)
+        continue;
+      }
+      // Vec3SGrid is single precision and Vec3DGrid is for double precision
+      openvdb::Vec3SGrid::Ptr vecGrid = openvdb::Vec3SGrid::create();
+      // see https://www.openvdb.org/documentation/doxygen/namespaceopenvdb_1_1v8__0.html#ae93f92d10730a52ed3b207d5811f6a6e
+      if (strcmp(arrayName, "color"))
+      {
+        vecGrid->setVectorType(openvdb::VEC_CONTRAVARIANT_RELATIVE);
+      }
+      else
+      {
+        vecGrid->setVectorType(openvdb::VEC_INVARIANT);
+      }
+      vecGrid->setGridClass(openvdb::GRID_FOG_VOLUME);
+
+      openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create();
+      // enum GridClass {
+      //     GRID_UNKNOWN = 0,
+      //     GRID_LEVEL_SET,
+      //     GRID_FOG_VOLUME,
+      //     GRID_STAGGERED
+      // };
+      grid->setGridClass(openvdb::GRID_FOG_VOLUME);
+      std::string vdbName = GetVDBGridName(arrayName, component, numberOfComponents);
+      grid->setName(vdbName);
+      vecGrid->setName(vdbName);
+      openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
+      openvdb::Vec3SGrid::Accessor vecAccessor = vecGrid->getAccessor();
+      openvdb::Coord ijk;
+
+      //openvdb::Coord ijk;
+
+      int &i = ijk[0], &j = ijk[1], &k = ijk[2];
+      for(k = extent[4]; k < extent[5]; ++k)
+      {
+        for(j = extent[2]; j < extent[3]; ++j)
         {
-          //cerr << this->Controller->GetLocalProcessId() << " is writing " << i << " " << j << " " << k << " " << data->GetTuple1(counter) << endl;
-          accessor.setValue(ijk, data->GetTuple1(counter));
-          counter++;
+          for(i = extent[0]; i < extent[1]; ++i)
+          {
+            int vtkijk[3] = {i, j, k};
+            vtkIdType cellId = imageData->ComputeCellId(vtkijk);
+            if (needToUpdateBoundsAndCenter && cellGhostType)
+            {
+              if (cellGhostType->GetTuple1(cellId) == 0)
+              {
+                if (needToUpdateBoundsAndCenter)
+                {
+                  double coords[3];
+                  vtkIdType pointId = imageData->ComputePointId(vtkijk);
+                  imageData->GetPoint(pointId, coords);
+                  for (int c=0;c<3;c++)
+                  {
+                    coords[c] += halfCellSize[c];
+                    if (coords[c] < bounds[2*c])
+                    {
+                      bounds[2*c] = coords[c];
+                    }
+                    if (coords[c] > bounds[2*c+1])
+                    {
+                      bounds[2*c+1] = coords[c];
+                    }
+                  }
+                }
+              }
+            }
+
+            if (!cellGhostType || cellGhostType->GetTuple1(cellId) == 0)
+            {
+              if (numberOfComponents == 3)
+              {
+                double tuple[3];
+                data->GetTuple(cellId, tuple);
+                openvdb::Vec3f ftuple(tuple[0], tuple[1], tuple[2]);
+                vecAccessor.setValue(ijk, ftuple);
+              }
+              else
+              {
+                accessor.setValue(ijk, data->GetComponent(cellId, component));
+              }
+            }
+          }
         }
       }
 
-
       grid->setTransform(linearTransform);
+      vecGrid->setTransform(linearTransform);
 
-    }
-    grids.push_back(grid);
-  }
+      if (numberOfComponents == 3)
+      {
+        grids.push_back(vecGrid);
+      }
+      else
+      {
+        grids.push_back(grid);
+      }
+    } // iterator over number of components
+  } // iterate over arrays
+
   // if no point data or no cell data then we just add in a value of 1 for the voxels for the cells
   if (grids.empty())
   {
@@ -428,12 +740,12 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
 //     GRID_STAGGERED
 // };
     grid->setGridClass(openvdb::GRID_FOG_VOLUME);
-    grid->setName("blank"); // ACB find a better name
+    grid->setName("empty");
     openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
     openvdb::Coord ijk;
 
     int &i = ijk[0], &j = ijk[1], &k = ijk[2];
-    // for cell data we don't have to worry ghost cells. hopefully they're gone in parallel. -- check this ACB
+    // if we're here we don't have any ghost info since it would be stored in point or cell data
     for(k = extent[4]; k < extent[5]; ++k)
     {
       for(j = extent[2]; j < extent[3]; ++j)
@@ -443,51 +755,28 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
           accessor.setValue(ijk, 1.);
         }
       }
-
       grid->setTransform(linearTransform);
-
     }
     grids.push_back(grid);
-
-
   }
 
-  //openvdb::io::File(output.data()).write({grid});
-  //openvdb::io::File(this->FileName).write({grid});
-  std::ostringstream oss;
-  oss << std::setw(5) << std::setfill('0') << this->CurrentTimeIndex;
-  if (this->Controller->GetNumberOfProcesses() == 1)
+  for (auto& grid : grids)
   {
-    if (this->WriteAllTimeSteps && this->NumberOfTimeSteps > 1)
+    // meta-information to help orient the grid back to the original geometric location
+    grid->insertMeta("center",  openvdb::Vec3SMetadata(openvdb::Vec3f(center)));
+    grid->insertMeta("global center",  openvdb::Vec3SMetadata(openvdb::Vec3f(globalCenter)));
+    grid->insertMeta("min bounds",  openvdb::Vec3SMetadata(openvdb::Vec3f(bounds[0], bounds[2], bounds[4])));
+    grid->insertMeta("max bounds",  openvdb::Vec3SMetadata(openvdb::Vec3f(bounds[1], bounds[3], bounds[5])));
+    grid->insertMeta("global min bounds",  openvdb::Vec3SMetadata(openvdb::Vec3f(globalBounds[0], globalBounds[2], globalBounds[4])));
+    grid->insertMeta("global max bounds",  openvdb::Vec3SMetadata(openvdb::Vec3f(globalBounds[1], globalBounds[3], globalBounds[5])));
+    if (imageData->GetInformation()->Has(vtkDataObject::DATA_TIME_STEP()))
     {
-      std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(this->FileName);
-      std::string ext = vtksys::SystemTools::GetFilenameExtension(this->FileName);
-      std::string newFileName = fileNameBase+"_"+oss.str()+ext;
-      openvdb::io::File(newFileName).write(grids);
-    }
-    else
-    {
-      openvdb::io::File(this->FileName).write(grids);
-    }
-  }
-  else
-  {
-    if (this->WriteAllTimeSteps && this->NumberOfTimeSteps > 1)
-    {
-      std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(this->FileName);
-      std::string ext = vtksys::SystemTools::GetFilenameExtension(this->FileName);
-      std::string newFileName = fileNameBase+"_"+std::to_string(this->Controller->GetLocalProcessId())+
-        "_"+oss.str()+ext;
-      openvdb::io::File(newFileName).write(grids);
-    }
-    else
-    {
-      std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(this->FileName);
-      std::string ext = vtksys::SystemTools::GetFilenameExtension(this->FileName);
-      std::string newFileName = fileNameBase+"_"+std::to_string(this->Controller->GetLocalProcessId())+ext;
-      openvdb::io::File(newFileName).write(grids);
+      double time = imageData->GetInformation()->Get(vtkDataObject::DATA_TIME_STEP());
+      grid->insertMeta("time", openvdb::DoubleMetadata(time));
     }
   }
+
+  WriteVDBGrids(grids, this->Controller, this->FileName, this->WriteAllTimeSteps, this->NumberOfTimeSteps, this->CurrentTimeIndex);
 }
 
 //-----------------------------------------------------------------------------
@@ -496,93 +785,28 @@ void vtkVDBWriter::WritePointSet(vtkPointSet* pointSet)
   // openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create();
   // openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
   // openvdb::Coord xyz(1000, -200000000, 30000000); // ACB ???
+  openvdb::points::PointDataGrid::Ptr pointsGrid =
+    this->Internals->ProcessPointSet(pointSet, "Points");
 
-  std::vector<openvdb::Vec3R> positions;
-  double coord[3];
-  for (vtkIdType i=0;i<pointSet->GetNumberOfPoints();i++)
+  std::vector<openvdb::GridBase::Ptr> grids;
+  grids.push_back(pointsGrid);
+
+  if (pointSet->GetCellData()->GetNumberOfArrays() != 0 ||
+      pointSet->GetPointData()->GetNumberOfArrays() == 0)
   {
-    pointSet->GetPoint(i, coord);
-    positions.push_back(openvdb::Vec3R(static_cast<float>(coord[0]),
-                                       static_cast<float>(coord[1]),
-                                       static_cast<float>(coord[2])));
+    // need to use the CellCenters filter to get the center of each cell
+    vtkNew<vtkCellCenters> cellCenters;
+    cellCenters->SetInputData(pointSet);
+    cellCenters->SetVertexCells(true);
+    cellCenters->SetCopyArrays(true);
+    cellCenters->Update();
+
+    vtkPointSet* newPointSet = vtkPointSet::SafeDownCast(cellCenters->GetOutput());
+    grids.push_back(this->Internals->ProcessPointSet(newPointSet, "Cells"));
   }
 
-  // The VDB Point-Partioner is used when bucketing points and requires a
-  // specific interface. For convenience, we use the PointAttributeVector
-  // wrapper around an stl vector wrapper here, however it is also possible to
-  // write one for a custom data structure in order to match the interface
-  // required.
-  openvdb::points::PointAttributeVector<openvdb::Vec3R> positionsWrapper(positions);
-  // This method computes a voxel-size to match the number of
-  // points / voxel requested. Although it won't be exact, it typically offers
-  // a good balance of memory against performance.
-  int pointsPerVoxel = 8;
-  float voxelSize =
-    openvdb::points::computeVoxelSize(positionsWrapper, pointsPerVoxel);
-  // Create a transform using this voxel-size.
-  openvdb::math::Transform::Ptr transform =
-    openvdb::math::Transform::createLinearTransform(voxelSize);
-  // Create a PointIndexGrid. This can be done automatically on creation of
-  // the grid, however as this index grid is required for the position and
-  // radius attributes, we create one we can use for both attribute creation.
-  openvdb::tools::PointIndexGrid::Ptr pointIndexGrid =
-    openvdb::tools::createPointIndexGrid<openvdb::tools::PointIndexGrid>(
-      positionsWrapper, *transform);
-  // Create a PointDataGrid containing these four points and using the point
-  // index grid. This requires the positions wrapper.
-  openvdb::points::PointDataGrid::Ptr grid =
-    openvdb::points::createPointDataGrid<openvdb::points::NullCodec,
-                                         openvdb::points::PointDataGrid>(*pointIndexGrid, positionsWrapper, *transform);
 
-  // Set the name of the grid
-  grid->setName("Points");
-
-
-
-  for (int array=0;array<pointSet->GetPointData()->GetNumberOfArrays();array++)
-  {
-    std::vector<float> values;
-    vtkDataArray* data = pointSet->GetPointData()->GetArray(array);
-    const char* arrayName = data->GetName();
-    for (vtkIdType i=0;i<pointSet->GetNumberOfPoints();i++)
-    {
-      values.push_back(static_cast<float>(data->GetTuple1(i)));
-    }
-
-    // Append a data->GetName() attribute to the grid to hold the radius.
-    // This attribute storage uses a unit range codec to reduce the memory
-    // storage requirements down from 4-bytes to just 1-byte per value. This is
-    // only possible because accuracy of the radius is not that important to us
-    // and the values are always within unit range (0.0 => 1.0).
-    // Note that this attribute type is not registered by default so needs to be
-    // explicitly registered.
-    // using Codec = openvdb::points::FixedPointCodec</*1-byte=*/false,
-    //         openvdb::points::UnitRange>;
-    // openvdb::points::TypedAttributeArray<float, Codec>::registerType();
-    openvdb::NamePair radiusAttribute =
-      openvdb::points::TypedAttributeArray<float, openvdb::points::NullCodec>::attributeType();
-    openvdb::points::appendAttribute(grid->tree(), data->GetName(), radiusAttribute);
-    // Create a wrapper around the values vector.
-    openvdb::points::PointAttributeVector<float> valuesWrapper(values);
-    // Populate the data->GetName() attribute on the points
-    openvdb::points::populateAttribute<openvdb::points::PointDataTree,
-        openvdb::tools::PointIndexTree, openvdb::points::PointAttributeVector<float>>(
-          grid->tree(), pointIndexGrid->tree(), data->GetName(), valuesWrapper);
-
-
-
-  }
-  if (this->Controller->GetNumberOfProcesses() == 1)
-  {
-    openvdb::io::File(this->FileName).write({grid});
-  }
-  else
-  {
-    std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(this->FileName);
-    std::string ext = vtksys::SystemTools::GetFilenameExtension(this->FileName);
-    std::string newFileName = fileNameBase+"_"+std::to_string(this->Controller->GetLocalProcessId())+ext;
-    openvdb::io::File(newFileName).write({grid});
-  }
+  WriteVDBGrids(grids, this->Controller, this->FileName, this->WriteAllTimeSteps, this->NumberOfTimeSteps, this->CurrentTimeIndex);
 }
 
 //-----------------------------------------------------------------------------
@@ -630,22 +854,6 @@ void vtkVDBWriter::SetRGBA(
     }
     return;
   }
-  // else if (this->LookupTable != nullptr)
-  // { // use the data array mapped through lookup table
-  //   vtkSmartPointer<vtkUnsignedCharArray> colors = vtkSmartPointer<vtkUnsignedCharArray>::New();
-  //   colors->SetNumberOfComponents(3);
-  //   colors->SetNumberOfTuples(num);
-  //   c = colors->WritePointer(0, 3 * num);
-  //   for (i = 0; i < num; i++)
-  //   {
-  //     double* tuple = da->GetTuple(i);
-  //     const unsigned char* rgb = this->LookupTable->MapValue(tuple[this->Component]);
-  //     *c++ = rgb[0];
-  //     *c++ = rgb[1];
-  //     *c++ = rgb[2];
-  //   }
-  //   return colors;
-  // }
   // no lookup table
   return;
 }
@@ -664,4 +872,14 @@ void vtkVDBWriter::PrintSelf(ostream& os, vtkIndent indent)
   {
     os << indent << "Controller: (none)" << endl;
   }
+  if (this->LookupTable)
+  {
+    os << indent << "LookupTable: " << this->LookupTable << endl;
+  }
+  else
+  {
+    os << indent << "LookupTable: (none)" << endl;
+  }
+  os << indent << "EnableColoring: " << this->EnableColoring << endl;
+  os << indent << "EnableAlpha: " << this->EnableAlpha << endl;
 }

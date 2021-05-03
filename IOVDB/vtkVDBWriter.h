@@ -21,7 +21,7 @@
 #ifndef vtkVDBWriter_h
 #define vtkVDBWriter_h
 
-#include "vtkVDBWritersModule.h" //needed for exports
+#include "vtkVDBWritersModule.h"
 #include "vtkSmartPointer.h" // For protected ivars
 #include "vtkWriter.h"
 #include <string>
@@ -32,6 +32,7 @@ class vtkMultiProcessController;
 class vtkPointSet;
 class vtkScalarsToColors;
 class vtkUnsignedCharArray;
+class vtkVDBWriterInternals;
 
 class VTKVDBWRITERS_EXPORT vtkVDBWriter : public vtkWriter
 {
@@ -69,23 +70,8 @@ public:
 
   //@{
   /**
-   * Specify the array name to use to color the data.
-   */
-  /* vtkSetStringMacro(ArrayName); */
-  /* vtkGetStringMacro(ArrayName); */
-  //@}
-
-  //@{
-  /**
-   * Specify the array component to use to color the data.
-   */
-  vtkSetClampMacro(Component, int, 0, VTK_INT_MAX);
-  vtkGetMacro(Component, int);
-  //@}
-
-  //@{
-  /**
-   * Enable coloring.
+   * Enable coloring channel output based on LookupTable. The output
+   * channel will be named 'color'.
    */
   vtkSetMacro(EnableColoring, bool);
   vtkGetMacro(EnableColoring, bool);
@@ -93,7 +79,8 @@ public:
 
   //@{
   /**
-   * Enable coloring.
+   * Enable alpha channel output based on LookupTable. The output
+   * channel will be name 'alpha'.
    */
   vtkSetMacro(EnableAlpha, bool);
   vtkGetMacro(EnableAlpha, bool);
@@ -117,7 +104,6 @@ protected:
   void WriteImageData(vtkImageData* imageData);
   void WritePointSet(vtkPointSet* pointSet);
 
-
   // see algorithm for more info.
   // This writer takes in vtkTable, vtkDataSet or vtkCompositeDataSet.
   int FillInputPortInformation(int port, vtkInformation* info) override;
@@ -128,16 +114,12 @@ protected:
 
   void SetRGBA(vtkIdType num, vtkUnsignedCharArray* rgba, vtkDataSetAttributes* attributes);
 
-
   char* FileName;
 
   bool WriteAllTimeSteps;
 
   // For outputting the Lookup Table in the VDB file.
   // Copying what's done in vtkPLYWriter
-  //char* ArrayName;
-  std::string ArrayName;
-  int Component;
   vtkScalarsToColors* LookupTable;
   bool EnableColoring;
   bool EnableAlpha;
@@ -153,6 +135,9 @@ private:
   vtkIdType CurrentTimeIndex;
   // Internal variable to keep track of the number of time steps.
   vtkIdType NumberOfTimeSteps;
+
+  vtkVDBWriterInternals* Internals;
+  friend class vtkVDBWriterInternals;
 
   //class VDBFile;
 };

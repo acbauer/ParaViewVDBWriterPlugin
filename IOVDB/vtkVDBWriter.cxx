@@ -44,6 +44,8 @@
 #include <openvdb/points/PointCount.h>
 #include <openvdb/tools/Dense.h>
 
+//#include <tbb/tbb.h>
+
 namespace
 {
 std::string GetVDBGridName(const char* arrayName, int component, int numberOfComponents)
@@ -56,7 +58,6 @@ std::string GetVDBGridName(const char* arrayName, int component, int numberOfCom
   return vdbName;
 }
 
-
 void WriteVDBGrids(std::vector<openvdb::GridBase::Ptr>& grids, vtkMultiProcessController* controller, const char* fileName,
                    bool writeAllTimeSteps, vtkIdType numberOfTimeSteps, vtkIdType currentTimeIndex)
 {
@@ -66,9 +67,10 @@ void WriteVDBGrids(std::vector<openvdb::GridBase::Ptr>& grids, vtkMultiProcessCo
   {
     if (writeAllTimeSteps && numberOfTimeSteps > 1)
     {
+      std::string path = vtksys::SystemTools::GetFilenamePath(fileName);
       std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(fileName);
       std::string ext = vtksys::SystemTools::GetFilenameExtension(fileName);
-      std::string newFileName = fileNameBase+"_"+oss.str()+ext;
+      std::string newFileName = path + "/" + fileNameBase+"_"+oss.str()+ext;
       openvdb::io::File(newFileName).write(grids);
     }
     else
@@ -78,24 +80,22 @@ void WriteVDBGrids(std::vector<openvdb::GridBase::Ptr>& grids, vtkMultiProcessCo
   }
   else
   {
+    std::string path = vtksys::SystemTools::GetFilenamePath(fileName);
+    std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(fileName);
+    std::string ext = vtksys::SystemTools::GetFilenameExtension(fileName);
     if (writeAllTimeSteps && numberOfTimeSteps > 1)
     {
-      std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(fileName);
-      std::string ext = vtksys::SystemTools::GetFilenameExtension(fileName);
-      std::string newFileName = fileNameBase+"_"+std::to_string(controller->GetLocalProcessId())+
+      std::string newFileName = path+"/" + fileNameBase+"_"+std::to_string(controller->GetLocalProcessId())+
         "_"+oss.str()+ext;
       openvdb::io::File(newFileName).write(grids);
     }
     else
     {
-      std::string fileNameBase = vtksys::SystemTools::GetFilenameWithoutExtension(fileName);
-      std::string ext = vtksys::SystemTools::GetFilenameExtension(fileName);
-      std::string newFileName = fileNameBase+"_"+std::to_string(controller->GetLocalProcessId())+ext;
+      std::string newFileName = path+"/" + fileNameBase+"_"+std::to_string(controller->GetLocalProcessId())+ext;
       openvdb::io::File(newFileName).write(grids);
     }
   }
 }
-
 } // end anonymous namespace
 
 class vtkVDBWriterInternals
@@ -297,6 +297,7 @@ vtkCxxSetObjectMacro(vtkVDBWriter, LookupTable, vtkScalarsToColors);
 vtkVDBWriter::vtkVDBWriter()
 {
   // openvdb::initialize() can be called multiple times
+  //tbb::task_scheduler_init init(1);
   openvdb::initialize();
   this->FileName = nullptr;
   this->WriteAllTimeSteps = false;

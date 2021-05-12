@@ -283,6 +283,20 @@ public:
         grid->insertMeta("time", openvdb::DoubleMetadata(time));
       }
 
+      // enum GridClass {
+      //     GRID_UNKNOWN = 0,
+      //     GRID_LEVEL_SET,
+      //     GRID_FOG_VOLUME,
+      //     GRID_STAGGERED
+      // };
+      if (pointSet->IsA("vtkPolyData"))
+      {
+        grid->setGridClass(openvdb::GRID_LEVEL_SET);
+      }
+      else
+      {
+        grid->setGridClass(openvdb::GRID_FOG_VOLUME);
+      }
       return grid;
     }
 }; // end of vtkVDBWriterInternals class

@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -43,8 +44,6 @@
 #include <openvdb/points/PointConversion.h>
 #include <openvdb/points/PointCount.h>
 #include <openvdb/tools/Dense.h>
-
-//#include <tbb/tbb.h>
 
 namespace
 {
@@ -57,6 +56,33 @@ std::string GetVDBGridName(const char* arrayName, int component, int numberOfCom
   }
   return vdbName;
 }
+
+
+std::string MakeValidAttributeName(std::string& name)
+{
+  if (name.empty())
+  {
+    std::string output = "notspecified";
+    return output;
+  }
+  std::string output;
+  for (auto it=name.begin();it!=name.end();it++)
+  {
+    if (!(isalnum(*it) || (*it == '_') || (*it == '|') || (*it == ':')))
+    {
+      output.append("_");
+    }
+    else
+    {
+      output.append(1, *it);
+    }
+  }
+  // return std::find_if(name.begin(), name.end(),
+  //                     [&](int c) { return !(isalnum(c) || (c == '_') || (c == '|') || (c == ':')); } ) == name.end();
+
+  return output;
+}
+
 
 void WriteVDBGrids(std::vector<openvdb::GridBase::Ptr>& grids, vtkMultiProcessController* controller, const char* fileName,
                    bool writeAllTimeSteps, vtkIdType numberOfTimeSteps, vtkIdType currentTimeIndex)
@@ -96,6 +122,7 @@ void WriteVDBGrids(std::vector<openvdb::GridBase::Ptr>& grids, vtkMultiProcessCo
     }
   }
 }
+
 } // end anonymous namespace
 
 class vtkVDBWriterInternals
@@ -108,7 +135,7 @@ public:
   vtkVDBWriter* Writer;
 
 
-  openvdb::points::PointDataGrid::Ptr ProcessPointSet(vtkPointSet* pointSet, const char* gridName)
+  openvdb::points::PointDataGrid::Ptr ProcessPointSet(vtkPointSet* pointSet, const char* gridName, bool isAPolyData)
     {
       vtkIdType numPoints = pointSet->GetNumberOfPoints();
 
@@ -166,6 +193,13 @@ public:
       int pointsPerVoxel = 8;
       float voxelSize =
         openvdb::points::computeVoxelSize(positionsWrapper, pointsPerVoxel);
+
+      // voxelSize can't be too small or the OpenVDB library segfaults. 10e-5 is too small
+      if (voxelSize < 0.0001)
+      {
+        voxelSize = 0.0001;
+      }
+
       // Create a transform using this voxel-size.
       openvdb::math::Transform::Ptr transform =
         openvdb::math::Transform::createLinearTransform(voxelSize);
@@ -173,8 +207,8 @@ public:
       // the grid, however as this index grid is required for the position and
       // radius attributes, we create one we can use for both attribute creation.
       openvdb::tools::PointIndexGrid::Ptr pointIndexGrid =
-    openvdb::tools::createPointIndexGrid<openvdb::tools::PointIndexGrid>(
-      positionsWrapper, *transform);
+        openvdb::tools::createPointIndexGrid<openvdb::tools::PointIndexGrid>(
+          positionsWrapper, *transform);
       // Create a PointDataGrid containing these four points and using the point
       // index grid. This requires the positions wrapper.
       openvdb::points::PointDataGrid::Ptr grid =
@@ -182,8 +216,11 @@ public:
                                              openvdb::points::PointDataGrid>(*pointIndexGrid, positionsWrapper, *transform);
 
       // Set the name of the grid
+      std::string vdbName = gridName;
       grid->setName(gridName);
 
+      // VDB attributes need to have unique names
+      std::set<std::string> vdbNames;
 
       for (int array=0;array<pointData->GetNumberOfArrays();array++)
       {
@@ -197,7 +234,27 @@ public:
             continue;
           }
           std::string vdbName = GetVDBGridName(arrayName, component, numberOfComponents);
-          //cerr << "adding pointset vdbName " << vdbName << endl;
+          // a variety of characters aren't allowed in the attribute name
+          vdbName = MakeValidAttributeName(vdbName);
+          // also attribute names need to be unique in the VDB channel
+          if (vdbNames.find(vdbName) == vdbNames.end())
+          {
+            vdbNames.insert(vdbName);
+          }
+          else
+          {
+            int counter = 1;
+            std::string nextName = vdbName + "_" + std::to_string(counter);
+            bool found = vdbNames.find(nextName) != vdbNames.end();
+            while(found)
+            {
+              counter++;
+              nextName = vdbName + "_" + std::to_string(counter);
+              found = vdbNames.find(nextName) != vdbNames.end();
+            }
+            vdbName = nextName;
+            vdbNames.insert(vdbName);
+          }
 
           // Append a data->GetName() attribute to the grid to hold the radius.
           // This attribute storage uses a unit range codec to reduce the memory
@@ -283,13 +340,13 @@ public:
         grid->insertMeta("time", openvdb::DoubleMetadata(time));
       }
 
-      // enum GridClass {
+       // enum GridClass {
       //     GRID_UNKNOWN = 0,
       //     GRID_LEVEL_SET,
       //     GRID_FOG_VOLUME,
       //     GRID_STAGGERED
       // };
-      if (pointSet->IsA("vtkPolyData"))
+      if (isAPolyData)
       {
         grid->setGridClass(openvdb::GRID_LEVEL_SET);
       }
@@ -297,7 +354,8 @@ public:
       {
         grid->setGridClass(openvdb::GRID_FOG_VOLUME);
       }
-      return grid;
+
+     return grid;
     }
 }; // end of vtkVDBWriterInternals class
 
@@ -311,7 +369,6 @@ vtkCxxSetObjectMacro(vtkVDBWriter, LookupTable, vtkScalarsToColors);
 vtkVDBWriter::vtkVDBWriter()
 {
   // openvdb::initialize() can be called multiple times
-  //tbb::task_scheduler_init init(1);
   openvdb::initialize();
   this->FileName = nullptr;
   this->WriteAllTimeSteps = false;
@@ -427,6 +484,17 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
 
   double dx(0), dy(0), dz(0);
   imageData->GetSpacing(dx, dy, dz);
+
+  if ( (dx < 0.0001 && dx > 0.) || (dy < 0.0001 && dy > 0.) || (dz < 0.0001 && dz > 0.) )
+  {
+    vtkWarningMacro("Cell size is too small for VDB tolerances. Increasing to avoid segfault.");
+    while ( (dx < 0.0001 && dx > 0.) || (dy < 0.0001 && dy > 0.) || (dz < 0.0001 && dz > 0.) )
+    {
+      dx *= 2;
+      dy *= 2;
+      dz *= 2;
+    }
+  }
 
   // mat and linearTransform are used to transform our voxel geometry to the proper shape
   openvdb::math::Mat4d mat(dx, 0., 0., 0.,
@@ -797,11 +865,8 @@ void vtkVDBWriter::WriteImageData(vtkImageData* imageData)
 //-----------------------------------------------------------------------------
 void vtkVDBWriter::WritePointSet(vtkPointSet* pointSet)
 {
-  // openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create();
-  // openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
-  // openvdb::Coord xyz(1000, -200000000, 30000000); // ACB ???
   openvdb::points::PointDataGrid::Ptr pointsGrid =
-    this->Internals->ProcessPointSet(pointSet, "Points");
+    this->Internals->ProcessPointSet(pointSet, "Points", pointSet->IsA("vtkPolyData"));
 
   std::vector<openvdb::GridBase::Ptr> grids;
   grids.push_back(pointsGrid);
@@ -817,7 +882,8 @@ void vtkVDBWriter::WritePointSet(vtkPointSet* pointSet)
     cellCenters->Update();
 
     vtkPointSet* newPointSet = vtkPointSet::SafeDownCast(cellCenters->GetOutput());
-    grids.push_back(this->Internals->ProcessPointSet(newPointSet, "Cells"));
+
+    grids.push_back(this->Internals->ProcessPointSet(newPointSet, "Cells", pointSet->IsA("vtkPolyData")));
   }
 
 
